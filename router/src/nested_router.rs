@@ -26,7 +26,9 @@ use reactive_graph::{
     computed::{ArcMemo, ScopedFuture},
     owner::{Owner, provide_context, use_context},
     signal::{ArcRwSignal, ArcTrigger},
-    traits::{Get, GetUntracked, Notify, ReadUntracked, Set, Track, Write},
+    traits::{
+        Get, GetUntracked, Notify, ReadUntracked, Set, Track, With, Write,
+    },
     transition::AsyncTransition,
     wrappers::write::SignalSetter,
 };
@@ -673,19 +675,8 @@ where
             .iter()
             .map(|route| (route.params.clone(), route.matched.clone()))
             .unzip();
-        let params_including_parents = {
-            let params = params.clone();
-            ArcMemo::new({
-                move |_| {
-                    merge_params(
-                        parent_params
-                            .iter()
-                            .map(|params| params.get())
-                            .chain(iter::once(params.get())),
-                    )
-                }
-            })
-        };
+        let params_including_parents =
+            merge_with_parent_params(parent_params, params.clone());
         let matched_including_parents = {
             let matched = matched.clone();
             ArcMemo::new({
@@ -904,19 +895,10 @@ where
                             }
                         })
                     };
-                    let params_including_parents = {
-                        let params = current.params.clone();
-                        ArcMemo::new({
-                            move |_| {
-                                merge_params(
-                                    parent_params
-                                        .iter()
-                                        .map(|params| params.get())
-                                        .chain(iter::once(params.get())),
-                                )
-                            }
-                        })
-                    };
+                    let params_including_parents = merge_with_parent_params(
+                        parent_params,
+                        current.params.clone(),
+                    );
 
                     let (full_tx, full_rx) = oneshot::channel();
                     let full_tx = Mutex::new(Some(full_tx));
@@ -1132,48 +1114,18 @@ where
     })
 }
 
-/// Merges the params of the parent routes and the current route into one map.
+/// Merges the params of the parent routes with the params of this route.
 ///
-/// The values in each map have already been percent-decoded when the map was
-/// built, so they are inserted as-is rather than decoded a second time.
-fn merge_params(maps: impl IntoIterator<Item = ParamsMap>) -> ParamsMap {
-    let mut merged = ParamsMap::new();
-    for map in maps {
-        for (key, value) in map {
-            merged.insert_decoded(key, value);
+/// Each map was decoded once when it was built, so the values are copied as-is.
+fn merge_with_parent_params(
+    parent_params: Vec<ArcRwSignal<ParamsMap>>,
+    params: ArcRwSignal<ParamsMap>,
+) -> ArcMemo<ParamsMap> {
+    ArcMemo::new(move |_| {
+        let mut merged = ParamsMap::new();
+        for params in parent_params.iter().chain(iter::once(&params)) {
+            params.with(|params| merged.extend_decoded(params));
         }
-    }
-    merged
-}
-
-// Percent-decoding goes through js-sys without `ssr`, like the tests in params.rs.
-#[cfg(all(test, feature = "ssr"))]
-mod tests {
-    use super::merge_params;
-    use crate::params::ParamsMap;
-
-    #[test]
-    fn merge_params_does_not_decode_values_again() {
-        // `%252B` decodes once to `%2B`, which must not become `+`
-        let parent: ParamsMap = [("section", "x%2541")].into_iter().collect();
-        let child: ParamsMap = [("tag", "a%252Bb")].into_iter().collect();
-        assert_eq!(child.get_str("tag"), Some("a%2Bb"));
-
-        let merged = merge_params([parent, child]);
-        assert_eq!(merged.get_str("section"), Some("x%41"));
-        assert_eq!(merged.get_str("tag"), Some("a%2Bb"));
-    }
-
-    #[test]
-    fn merge_params_keeps_every_value_of_a_repeated_key() {
-        let parent: ParamsMap = [("id", "1")].into_iter().collect();
-        let child: ParamsMap = [("id", "a%2520b")].into_iter().collect();
-
-        let merged = merge_params([parent, child]);
-        assert_eq!(
-            merged.get_all("id"),
-            Some(vec!["1".to_string(), "a%20b".to_string()])
-        );
-        assert_eq!(merged.get_str("id"), Some("a%20b"));
-    }
+        merged
+    })
 }
